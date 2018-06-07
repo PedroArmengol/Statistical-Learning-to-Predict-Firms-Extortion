@@ -1,0 +1,467 @@
+---
+title: "Research_Crime_Econ"
+author: "Pedro Armengol"
+date: "15/5/2018"
+output: pdf_document
+---
+
+#SETUP
+```{r setup, include=FALSE}
+
+rm(list = ls())
+#Check which libraries they where not able to upload
+library("RANN")
+library("kernlab")
+library("stepPlr")
+library("e1071")
+library("LiblineaR")
+library("h2o")
+library("AER")
+library("stargazer")
+library("maptools")
+library("stringr")
+library("devtools")
+library("extrafont")
+library("ggthemes")
+library("readr")
+library("haven")
+library("dplyr")
+library("tidyr")
+library("stringr")
+library("ggplot2")
+library("plyr")
+library("ggrepel")
+library("gridExtra")
+library("gdata") 
+library("readxl")
+library("scales")
+library("gtable")
+library("ggmap")
+library("foreign")
+library("readstata13")
+library("data.table")
+library("corrplot")
+library("tidyverse")
+library("caret")
+library("mlbench")
+library("SMCRM")
+library("AppliedPredictiveModeling")
+library("mlr")
+library("MLmetrics")
+library("PRROC")
+library("randomForest") 
+library("rpart") 
+```
+
+#Functions
+```{r functions}
+pr_curve <- function(y_probs, y_actual) {
+  
+  seq= seq(0, 0.95, by=0.05)
+  data <- data.frame(threshold = numeric(0), precision = numeric(0), recall = numeric(0))
+  
+  for (n in seq) {
+    #Generate precision recall
+    pred <- as.numeric(y_probs >= n)
+    TP <- as.numeric(pred == y_actual & pred ==1)
+    FP <- as.numeric(pred != y_actual & pred ==1)
+    FN <- as.numeric(pred != y_actual & y_actual ==1)
+    precision <- sum(TP)/(sum(TP)+sum(FP))
+    recall <- sum(TP)/(sum(TP) + sum(FN))
+    #Append metrics
+    obs <- data.frame(threshold = n, precision = precision, recall = recall)
+    data <- rbind(data,obs)
+  }
+  
+  #Graph Doble Axis
+  par(mar = c(5, 4, 4, 4) + 0.3)  # Leave space for y2 axis
+  plot(data[["threshold"]], data[["precision"]], xlab = "", ylab = "") # first plot
+  par(new = TRUE)
+  plot(data[["threshold"]], data[["recall"]], type = "l", axes = FALSE, bty = "n", xlab = "Threshold", ylab = "Precision")
+  axis(side=4, at = pretty(range(data[["recall"]])))
+  mtext("Recall", side=4, line=3)
+  
+}  
+
+
+
+pipeline <- function(master, depvar, depvar_categ, depvar_continuos) {
+  #Convert classification columns into factors
+  master[depvar_categ] <- lapply(master[depvar_categ], factor)
+  #Missing values in the dataset
+  sum(is.na(master))
+  
+  for (i in depvar) {
+    print(i)
+    #SELECT DATASET
+    set.seed(1001)
+    #master <- master without NA's in dependent variable (we dont want to impute the predicted variable)
+    master_temp <- master[ which(is.na(master[[i]]) == FALSE), names(master) != "CVE_UNICA"]
+    print(paste("size of dataset: rows",dim(master_temp)[1]))
+    print(paste("size of dataset: columns",dim(master_temp)[2]))
+    #SPLITTING 
+    #Take 80% trainin and 20% testing (this command select the index that will belong to testing and training)
+    inTrain <- createDataPartition(y = master_temp[[i]], p=0.8, list = FALSE)
+    id_var <- master_temp[idvar]
+    dep_var <- master_temp[depvar]
+    train_X <- id_var[inTrain,]
+    test_X <- id_var[-inTrain,]
+    train_Y <- dep_var[inTrain,]
+    test_Y <- dep_var[-inTrain,]
+    
+    #Choose cross-validation
+    
+    # RUN MODELS
+    if (i %in% depvar_continuos) {
+      #Continues models
+      for (model in c("lm")) {
+        #ERROR HANDLING
+        print(model)
+        #Fitting
+        ## KNN will impute possible missing values in the independent variable
+        possibleError <- tryCatch(
+          result <- caret::train(train_X, train_Y[[i]], method = model, preProc = c("knnImpute","center", "scale")),
+          error=function(e) e
+        )
+        
+        if(!inherits(possibleError, "error")){
+          print("Metrics: Training Set (with cross-validation)")
+          #metrics of efficiency Training set (with cross-validation)
+          print(result)
+          
+        }
+      }
+      
+    }
+    else {
+      #Classification models
+      for (model in c("plr",'regLogistic','lssvmPoly','gbm_h2o','rf','rpart')) {
+        print(model)
+        #Error handling
+        possibleError <- tryCatch(
+          result <- caret::train(train_X, train_Y[[i]], method = model, preProc = c("knnImpute","center", "scale"), verbose = FALSE),
+          error=function(e) e
+        )
+        
+        if(!inherits(possibleError, "error")){
+          
+          #Metrics of efficiency Training set (with cross-validation)
+          print("Metrics: Training Set (with cross-validation)")
+          print(result)
+          
+          #Obtain prediction (First raw (don't know the cutt-off point for classification))
+          print("Metrics: Testing Set (Raw)")
+          predictions <- predict.train(result, test_X)
+          print(predictions)
+          print(table(predictions))
+          print(confusionMatrix(predictions, test_Y[[i]]))
+          
+          #Obtain predictions (probabilty and select cut-off point based on optimizing function)
+          print("Metrics: Training Set (Probs)")
+          predictions <- predict.train(result, test_X, type = "prob")
+          print(predictions)
+          #ROC metrics
+          a <- as.numeric(unlist(predictions["0"]))
+          b <- as.numeric(unlist(predictions["1"]))
+          pr<-pr.curve(scores.class0 = a, scores.class1 = b, curve = TRUE)
+          print(pr)
+          #PR Curve
+          print(plot(pr))
+          #Obtain feature importance
+          print(varImp(object = result))
+          print(plot(varImp(object = result, main = paste("X",":variable Importance"))))
+          #PR/Threshold Curve
+          print(b)
+          print(test_Y[[i]])
+          pr_curve(b, test_Y[[i]])
+          #IF Random Forest: plot number of trees related error
+          if(model == "rf") {
+            plot(result$finalModel)
+          }
+          #IF CART: plot "fancy" decision tree
+          if(model == 'rpart') {
+            fancyRpartPlot(result$finalModel)
+          }
+        }
+      }
+    }
+  }
+}
+
+```
+
+
+#CENSO 2014
+```{r censo}
+#CENSUS 2014
+#Read census
+census14 <- read.csv("/Users/pedro/Dropbox/Crime_Econ/Data/ECONOMIC CENSUS/Census 2014/CE2014.csv")
+#Dimensionality of the data
+dim(census14)
+#Rename clave unica del establecimiento to have a single identifier for this variable
+names(census14)[names(census14) == 'e03'] <- 'CVE_UNICA'
+#Check for repeated values
+n_occur <- data.frame(table(census14$CVE_UNICA))
+table(n_occur[n_occur$Freq>1,])
+#Feature Generation
+#Aggregate census category
+census14$clase <- as.character(census14$clase)
+subclase <- data.frame(substr(census14$clase,1,3))
+names(subclase)[names(subclase) == "substr.census14.clase..1..3."] <- 'subclase'
+#Create dummies of subclase
+dummies <- createDummyFeatures(subclase, cols = "subclase")
+#Create index to merge: both sets will be order in the same way
+dummies <- rownames_to_column(dummies, "index")
+#Create dummies by municipio
+#Format inegi variable: state
+census14$e04 <- as.character(census14$e04)
+census14$e04 <- trimws(census14$e04)
+#Add zeros variable state
+census14 = data.table(census14)
+census14[nchar(e04) == 1, e04 := paste0(0,e04)] 
+#Format inegi variable: municipality
+census14$e05 <- as.character(census14$e05)
+census14$e05 <- trimws(census14$e05)
+#Add zeros inegi variable municipality
+census14[nchar(e05) == 1, e05 := paste0(0,paste0(0,e05))] 
+census14[nchar(e05) == 2, e05 := paste0(0,e05)] 
+#generate clave by muncipio
+census14$cve_mun <- paste0(census14$e04,census14$e05)
+#Create dummies of municipality
+dummies1 <- createDummyFeatures(census14$cve_mun, cols = "cve_mun")
+#Create index to merge: both sets will be order in the same way
+dummies1 <- rownames_to_column(dummies1, "index")
+#Keep just predictive features
+id_var <- census14[,c(-2,-3,-4)]
+#Create index
+id_var <- rownames_to_column(id_var, "index")
+#Merge (subclase)
+id_var <- merge(id_var,dummies,by="index")
+#Merge 1 (municipality)
+id_var <- merge(id_var,dummies1,by="index")
+#Drop index and cve_mun
+id_var <- subset(id_var, select=-c(index,cve_mun))
+id_var <- as.data.frame(id_var)
+#List of dependent variables
+idvar <- names(id_var)[c(names(id_var) != "CVE_UNICA")]
+```
+
+#ENVE 2014
+```{r enve14}
+#ENVE 2014
+#Read ENVE
+enve14 <- read.csv("/Users/pedro/Dropbox/Crime_Econ/Data/VICTIMIZATION/enve_2014/enve_2014_csv/trenvecuest_esq_2014.csv")
+#Dimensionality of the data
+dim(enve14)
+#Check for repeated values
+n_occur <- data.frame(table(enve14$CVE_UNICA))
+table(n_occur[n_occur$Freq>1,])
+#Create dependent variables
+#Format missing values
+enve14$P8_11[enve14$P8_11 == 9] <- NA
+enve14$P8_12[enve14$P8_12 == 9] <- NA
+enve14$P10_4[enve14$P10_4 == 9 | enve14$P10_4 == 3] <- NA
+enve14$P23[enve14$P23 == 9] <- NA
+enve14$P24[enve14$P24 == 9] <- NA
+enve14$P25_1[enve14$P25_1 == 9] <- NA
+enve14$P25_2[enve14$P25_2 == 9] <- NA
+enve14$P25_3[enve14$P25_3 == 9] <- NA
+enve14$P25_4[enve14$P25_4 == 9] <- NA
+enve14$P25_5[enve14$P25_5 == 9] <- NA
+enve14$P25_6[enve14$P25_6 == 9] <- NA
+enve14$P25_7[enve14$P25_7 == 9] <- NA
+enve14$P25_8[enve14$P25_8 == 9] <- NA
+enve14$P25_9[enve14$P25_9 == 9] <- NA
+enve14$P25_10[enve14$P25_10 == 9] <- NA
+enve14$P25_11[enve14$P25_11 == 9] <- NA
+enve14$P25_12[enve14$P25_12 == 9] <- NA
+enve14$P25_13[enve14$P25_13 == 9] <- NA
+#around your locality there where extortions in 2013
+extortion_1 <- as.numeric(enve14$P8_11 == 1)
+#around your locality criminals asked for money in order to let you operate in 2013
+extortion_2 <- as.numeric(enve14$P8_12 == 1)
+#around your locality there where extortions in 2014 (the left of the, by then, remaining year)
+extortion_3 <- as.numeric(enve14$P10_4 == 1)
+#Firm was victim of extortion
+extortion_4 <- as.numeric(enve14$P25_10 == 1)
+#Numer of times firm was victim of extorion
+extortion_5 <- enve14$P26_10
+#Investment in security measures
+investment <- enve14$P14_1
+#Probability victim of any crime
+pr_victim_2013 <- as.numeric(enve14$P23 == 1)
+pr_victim_2014 <- as.numeric(enve14$P24 == 1)
+#Probability victim of a high profile crime
+pr_victim_high <- as.numeric(enve14$P25_9 == 1 | enve14$P25_10 == 1 | enve14$P25_11 == 1 | enve14$P25_12 == 1)
+#Probability victim of a low profile crime
+pr_victim_low <- as.numeric(enve14$P25_1 == 1 | enve14$P25_2 == 1 | enve14$P25_3 == 1 | enve14$P25_4 == 1 | enve14$P25_5 ==1 | enve14$P25_6 == 1 | enve14$P25_7 == 1 | enve14$P25_8 == 1 | enve14$P25_13 == 1)
+#Create dataframe of independent variables
+dep_var14 <- data.frame(enve14$CVE_UNICA, extortion_1, extortion_2, extortion_3, extortion_4, extortion_5,investment,pr_victim_2013,pr_victim_2014,pr_victim_low,pr_victim_high)
+names(dep_var14)[names(dep_var14) == 'enve14.CVE_UNICA'] <- 'CVE_UNICA'
+#List dependent variables
+depvar14 <- c("extortion_1", "extortion_2", "extortion_3", "extortion_4", "extortion_5","investment","pr_victim_2013","pr_victim_2014","pr_victim_low","pr_victim_high")
+
+```
+
+#ENVE 2016
+```{r enve16}
+#ENVE 2016
+#Read ENVE
+enve16 <- read.csv("/Users/pedro/Dropbox/Crime_Econ/Data/VICTIMIZATION/enve_2016/trenvecuest_esq_2016.csv")
+#Dimensionality of the data
+dim(enve16)
+#Check for repeated values
+n_occur <- data.frame(table(enve16$CVE_UNICA))
+table(n_occur[n_occur$Freq>1,])
+#Create dependent variables
+#Format missing values
+enve16$P8_12[enve16$P8_12 == 9] <- NA
+enve16$P8_13[enve16$P8_13 == 9] <- NA
+enve16$P10_4[enve16$P10_4 == 9 | enve16$P10_4 == 3] <- NA
+enve16$P23[enve16$P23 == 9] <- NA
+enve16$P24[enve16$P24 == 9] <- NA
+enve16$P25_1[enve16$P25_1 == 9] <- NA
+enve16$P25_2[enve16$P25_2 == 9] <- NA
+enve16$P25_3[enve16$P25_3 == 9] <- NA
+enve16$P25_4[enve16$P25_4 == 9] <- NA
+enve16$P25_5[enve16$P25_5 == 9] <- NA
+enve16$P25_6[enve16$P25_6 == 9] <- NA
+enve16$P25_7[enve16$P25_7 == 9] <- NA
+enve16$P25_8[enve16$P25_8 == 9] <- NA
+enve16$P25_9[enve16$P25_9 == 9] <- NA
+enve16$P25_10[enve16$P25_10 == 9] <- NA
+enve16$P25_11[enve16$P25_11 == 9] <- NA
+enve16$P25_12[enve16$P25_12 == 9] <- NA
+enve16$P25_13[enve16$P25_13 == 9] <- NA
+enve16$P25_14[enve16$P25_14 == 9] <- NA
+#around your locality there where extortions in 2015
+extortion_1 <- as.numeric(enve16$P8_12 == 1)
+#around your locality criminals asked for money in order to let you operate in 2016
+extortion_2 <- as.numeric(enve16$P8_13 == 1)
+#around your locality there where extortions in 2016 (the left of the, by then, remaning year)
+extortion_3 <- as.numeric(enve16$P10_4 == 1)
+#Firm was victim of extortion
+extortion_4 <- as.numeric(enve16$P25_10 == 1)
+#Numer of times firm was victim of extorion
+extortion_5 <- enve16$P26_10
+#Investment in security measures
+investment <- enve16$P14_1
+#Probability victim of any crime
+pr_victim_2015 <- as.numeric(enve16$P23 == 1)
+pr_victim_2016 <- as.numeric(enve16$P24 == 1)
+#Probability victim of a high profile crime
+pr_victim_high <- as.numeric(enve16$P25_9 == 1 | enve16$P25_10 == 1 | enve16$P25_11 == 1 | enve16$P25_12 == 1)
+#Probability victim of a low profile crime
+pr_victim_low <- as.numeric(enve16$P25_1 == 1 | enve16$P25_2 == 1 | enve16$P25_3 == 1 | enve16$P25_4 == 1 | enve16$P25_5 ==1 | enve16$P25_6 == 1 | enve16$P25_7 == 1 | enve16$P25_8 == 1 | enve16$P25_13 == 1 | enve16$P25_14 == 1)
+#Create dataframe of independent variables
+dep_var16 <- data.frame(enve16$CVE_UNICA, extortion_1, extortion_2, extortion_3, extortion_4, extortion_5,investment,pr_victim_2015,pr_victim_2016,pr_victim_low,pr_victim_high)
+names(dep_var16)[names(dep_var16) == 'enve16.CVE_UNICA'] <- 'CVE_UNICA'
+#List dependent variables
+depvar16 <- c("extortion_1", "extortion_2", "extortion_3", "extortion_4", "extortion_5","investment","pr_victim_2015","pr_victim_2016","pr_victim_low","pr_victim_high")
+
+```
+
+
+#DESCRIPTIVE STATISTICS
+```{r statistics}
+
+# DESCRIPTIVE STATISTICS 
+
+# ENVE 2014
+#ENVE: dependent variables (baseline metrics)
+for (i in depvar14) {
+  
+  print(paste("NA's in",paste(i,sum(is.na(dep_var14[i])))))
+  print(paste("table in",dep_var14[i]))
+  print(table(dep_var14[i]))
+  print(paste("Summary in",dep_var14[i]))
+  print(summary(dep_var14[i]))
+  
+}
+
+#Correlations between independt variables
+correlations = cor(dep_var14)
+corrplot(correlations, method = "color")
+
+
+# ENVE 2016
+#ENVE: dependent variables (baseline metrics)
+for (i in depvar16) {
+  
+  print(paste("NA's in",paste(i,sum(is.na(dep_var16[i])))))
+  print(paste("table in",dep_var16[i]))
+  print(table(dep_var16[i]))
+  print(paste("Summary in",dep_var16[i]))
+  print(summary(dep_var16[i]))
+  
+}
+
+#Correlations between independt variables
+correlations = cor(dep_var16)
+corrplot(correlations, method = "color")
+
+
+#CENSUS
+#Summary stats of the independent variable (features of the merchant)
+#This works because id_var is a list of names (names(id_var) but also a dataframe)
+for (i in idvar) {
+  
+  print(paste("NA's in",paste(i,sum(is.na(id_var[i])))))
+  print(summary(id_var[i]))
+  
+}
+
+```
+
+#MERGE PROJECTS
+```{r merge}
+#MERGE CENSUS - ENVES
+#Merge two datasets 2014
+master14 <- merge(id_var,dep_var14, by= "CVE_UNICA")
+#How many observations do we have after one to one matching
+dim(master14)
+
+#Merge two datasets 2016
+master16 <- merge(id_var,dep_var16, by= "CVE_UNICA")
+#How many observations do we have after one to one matching
+dim(master16)
+
+```
+
+
+
+
+#STATISTICAL LEARNING PIPELINE
+```{r pipeline}
+#STATISTICAL LEARNING PIPELINE
+depvar14 <- c("extortion_1", "extortion_2", "extortion_3", "extortion_4", "extortion_5","investment","pr_victim_2013","pr_victim_2014","pr_victim_low","pr_victim_high")
+depvar16 <- c("extortion_1", "extortion_2", "extortion_3", "extortion_4", "extortion_5","investment","pr_victim_2015","pr_victim_2016","pr_victim_low","pr_victim_high")
+depvar_categ14 <- c("extortion_1", "extortion_2", "extortion_3", "extortion_4","pr_victim_2013","pr_victim_2014","pr_victim_low","pr_victim_high")
+depvar_categ16 <- c("extortion_1", "extortion_2", "extortion_3", "extortion_4","pr_victim_2015","pr_victim_2016","pr_victim_low","pr_victim_high")
+depvar_continuos <- c("investment", "extortion_5")
+
+# Types of models
+# Linear regression (lm)
+# Penalized Logistic Regression (plr)
+# Regularized Logistic Regression(regLogistic)
+# Least Squares Support Vector Machine with Polynomial Kernel (lssvmPoly)
+# Gradient Boosting Machines (gbm_h2o)
+# Random Forest (rf)
+# CART (rpart)
+
+#Run pipelines
+pipeline(master14,depvar14,depvar_categ14,depvar_continuos)
+pipeline(master16,depvar16,depvar_categ16,depvar_continuos)
+```
+
+# EXTRAPOLATION
+
+```{r extrapolation}
+
+```
+
+# CORRELATION PREDICTIONS, SESNSP Firms victimization
+
+```{r correlation_predictions}
+
+```
